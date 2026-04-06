@@ -2,7 +2,7 @@
 set -e
 
 echo "=========================================================="
-echo "🚀 Initiating Interactive Kubernetes, Docker & Cilium Build"
+echo "🚀 Initiating Interactive Kubernetes & Calico Build"
 echo "=========================================================="
 
 # ==========================================================
@@ -12,20 +12,17 @@ echo ""
 echo "--- 🛠️  Customization Parameters ---"
 echo "Press [ENTER] to accept the default values."
 
-read -p "Enter username for new sudo user [aiden]: " NEW_USER
-NEW_USER=${NEW_USER:-aiden}
+read -p "Enter username for new sudo user [AIDEN]: " NEW_USER
+NEW_USER=${NEW_USER:-AIDEN}
 
 read -p "Enter password for user '$NEW_USER' [AIDEN#]: " NEW_USER_PASS
-NEW_USER_PASS=${NEW_USER_PASS:-AIDEN#}
+NEW_USER_PASS=${NEW_USER_PASS:-AIDEN}
 
-read -p "Enter Kubernetes Version (e.g., v1.29, v1.30, v1.31) [v1.30]: " K8S_VERSION
-K8S_VERSION=${K8S_VERSION:-v1.30}
+read -p "Enter Kubernetes Version (e.g., v1.29, v1.30, v1.31) [v1.33]: " K8S_VERSION
+K8S_VERSION=${K8S_VERSION:-v1.33}
 
-read -p "Enter Pod Network CIDR [10.244.0.0/16]: " POD_CIDR
-POD_CIDR=${POD_CIDR:-10.244.0.0/16}
-
-read -p "Enter Hubble CLI version [v1.18.6]: " HUBBLE_VERSION
-HUBBLE_VERSION=${HUBBLE_VERSION:-v1.18.6}
+read -p "Enter Pod Network CIDR [192..0.0/16]: " POD_CIDR
+POD_CIDR=${POD_CIDR:-192.168.0.0/16}
 
 echo ""
 echo "--- 🌐 Network Interface Selection ---"
@@ -38,7 +35,7 @@ for i in "${!INT_ARRAY[@]}"; do
     echo "  [$i] ${INT_ARRAY[$i]}"
 done
 
-read -p "Select the network interface number for the API Server and Cilium [0]: " INT_SELECTION
+read -p "Select the network interface number for the API Server [0]: " INT_SELECTION
 INT_SELECTION=${INT_SELECTION:-0}
 
 # Extract the interface name and IP address based on user selection
@@ -79,6 +76,7 @@ br_netfilter
 EOF
 modprobe overlay
 modprobe br_netfilter
+mkdir -p /disk
 
 cat <<EOF > /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
@@ -87,17 +85,17 @@ net.ipv4.ip_forward                 = 1
 EOF
 sysctl --system
 
-# 4. Install Docker & Containerd
-echo "[4/8] Installing Docker Engine & Containerd..."
+# 4. Install Containerd
+echo "[4/8] Installing Containerd..."
+# Add the repository that provides containerd.io
 yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo
-dnf install -y docker-ce docker-ce-cli containerd.io
+dnf install -y containerd.io
 
 # Configure containerd to use Systemd Cgroup (Crucial for stability)
 containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
 systemctl enable --now containerd
-systemctl enable --now docker
 
 # 5. Add Kubernetes Repository & Install Components
 echo "[5/8] Installing Kubeadm, Kubelet, and Kubectl ($K8S_VERSION)..."
@@ -136,27 +134,22 @@ echo "[7/8] Removing control-plane taint for single-node operation..."
 export KUBECONFIG=/etc/kubernetes/admin.conf
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
 
-# 8. Install Cilium CNI and Other Cilium Components
-echo "[8/8] Installing Cilium CNI on interface $SELECTED_IFACE..."
-CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
-CLI_ARCH=amd64
-curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz
-tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
-rm cilium-linux-${CLI_ARCH}.tar.gz
+# 8. Install Calico CNI
+echo "[8/8] Installing Calico CNI..."
+CALICO_VERSION=$(curl -fsSL https://api.github.com/repos/projectcalico/calico/releases/latest \
+  | grep -Eo '"tag_name":\s*"[^"]+"' \
+  | head -n1 \
+  | cut -d'"' -f4)
+if [ -z "${CALICO_VERSION}" ]; then
+  echo "Failed to resolve latest Calico release." >&2
+  exit 1
+fi
 
-cilium install \
-  --set ipam.operator.clusterPoolIPv4PodCIDRList\[0\]="$POD_CIDR" \
-  --set ipam.operator.clusterPoolIPv4MaskSize=22 \
-  --set devices="$SELECTED_IFACE"
-
-cilium hubble enable --ui
-curl -L --fail --remote-name-all https://github.com/cilium/hubble/releases/download/"$HUBBLE_VERSION"/hubble-linux-amd64.tar.gz
-sudo tar xzvfC hubble-linux-amd64.tar.gz /usr/local/bin
-rm hubble-linux-amd64.tar.gz
-
-cilium status --wait
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml
 
 echo "=========================================================="
 echo "✅ Infrastructure layer successfully provisioned!"
 echo "Run 'kubectl get nodes -w' to watch your node become Ready."
 echo "=========================================================="
+
+kubcectl get nodes -w
