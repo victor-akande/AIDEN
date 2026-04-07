@@ -1,4 +1,4 @@
-# Aiden Labs Setup Scripts
+# AIDEN Lab Setup Scripts
 
 This repository contains a collection of shell scripts that automate the installation, configuration, and teardown of AIDEN Lab in a Single-Node Kubernetes environment with Calico networking and KubeVirt.
 
