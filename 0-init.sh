@@ -21,7 +21,7 @@ NEW_USER_PASS=${NEW_USER_PASS:-AIDEN}
 read -p "Enter Kubernetes Version (e.g., v1.29, v1.30, v1.31) [v1.33]: " K8S_VERSION
 K8S_VERSION=${K8S_VERSION:-v1.33}
 
-read -p "Enter Pod Network CIDR [192..0.0/16]: " POD_CIDR
+read -p "Enter Pod Network CIDR [192.168.0.0/16]: " POD_CIDR
 POD_CIDR=${POD_CIDR:-192.168.0.0/16}
 
 echo ""
@@ -84,6 +84,10 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
 sysctl --system
+sysctl -w net.ipv4.ip_forward=1
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+  echo 1 > /proc/sys/net/ipv4/ip_forward
+fi
 
 # 4. Install Containerd
 echo "[4/8] Installing Containerd..."
