@@ -121,7 +121,7 @@ kubeadm init \
   --cri-socket unix:///var/run/containerd/containerd.sock \
   --pod-network-cidr="$POD_CIDR" \
   --apiserver-advertise-address="$SELECTED_IP" \
-  --v=7
+  --v=9
 
 # Configure kubectl for root
 mkdir -p /root/.kube
@@ -155,5 +155,3 @@ echo "=========================================================="
 echo "✅ Infrastructure layer successfully provisioned!"
 echo "Run 'kubectl get nodes -w' to watch your node become Ready."
 echo "=========================================================="
-
-kubcectl get nodes -w

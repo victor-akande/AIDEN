@@ -18,9 +18,8 @@ VM_CORES=${VM_CORES:-2}
 read -p "Enter VM Name Prefix [aiden-labs]: " VM_PREFIX
 VM_PREFIX=${VM_PREFIX:-aiden-labs}
 
-# 2. Configuration (Aligned with your Dockerfile)
+# 2. Configuration 
 IMAGE_NAME="docker.io/victhedev/aiden:latest"
-# This MUST match the 'COPY' destination in your Dockerfile
 IMAGE_PATH="/disk/disk.qcow2" 
 USERNAME="AIDEN"
 PASSWORD="AIDEN"
