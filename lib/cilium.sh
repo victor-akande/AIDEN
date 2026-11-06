@@ -9,9 +9,12 @@
 #   - L2 announcements + LB IPAM
 #   - Hubble (relay + UI) and the hubble CLI
 #
-# Optional environment overrides:
-#   CILIUM_VERSION   e.g. 1.20.4 (default: latest stable)
+# Versions are pinned in lib/versions.sh. Optional environment override:
+#   CILIUM_VERSION   e.g. 1.20.4 (default: AIDEN_CILIUM_VERSION)
 # ==========================================================
+
+# shellcheck source=lib/versions.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/versions.sh"
 
 AIDEN_STATE_DIR=${AIDEN_STATE_DIR:-/var/lib/aiden-lab}
 
@@ -73,29 +76,21 @@ cilium_install() {
   arch=$(aiden_arch)
 
   if ! command -v cilium >/dev/null 2>&1; then
-    local cli_version
-    cli_version=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+    local cli_version=$AIDEN_CILIUM_CLI_VERSION
     echo "   -> Installing cilium CLI ${cli_version}..."
     aiden_install_tarball_bin cilium \
       "https://github.com/cilium/cilium-cli/releases/download/${cli_version}/cilium-linux-${arch}"
   fi
 
   if ! command -v hubble >/dev/null 2>&1; then
-    local hubble_version
-    hubble_version=$(curl -fsSL https://raw.githubusercontent.com/cilium/hubble/main/stable.txt)
+    local hubble_version=$AIDEN_HUBBLE_CLI_VERSION
     echo "   -> Installing hubble CLI ${hubble_version}..."
     aiden_install_tarball_bin hubble \
       "https://github.com/cilium/hubble/releases/download/${hubble_version}/hubble-linux-${arch}"
   fi
 
-  if [ -z "${CILIUM_VERSION}" ]; then
-    CILIUM_VERSION=$(curl -fsSL https://raw.githubusercontent.com/cilium/cilium/main/stable.txt)
-  fi
+  CILIUM_VERSION=${CILIUM_VERSION:-$AIDEN_CILIUM_VERSION}
   CILIUM_VERSION=${CILIUM_VERSION#v}
-  if [ -z "$CILIUM_VERSION" ]; then
-    echo "Failed to resolve the latest Cilium release. Set CILIUM_VERSION and retry." >&2
-    return 1
-  fi
   # BGP v2 resources (CiliumBGPClusterConfig etc.) need Cilium >= 1.16
   local major minor
   IFS=. read -r major minor _ <<<"$CILIUM_VERSION"

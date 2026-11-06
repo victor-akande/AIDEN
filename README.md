@@ -19,7 +19,7 @@ This repository contains a collection of shell scripts that automate the install
 
 - `1-kubevirt-setup.sh`
   - Checks for hardware virtualization (`/dev/kvm`) and offers software emulation if it is missing.
-  - Installs the latest KubeVirt operator and custom resources.
+  - Installs the pinned KubeVirt operator and custom resources.
   - Downloads and installs the `virtctl` tool.
   - Pulls the custom AIDEN Lab disk image into the containerd image store.
   - On multi-node clusters, installs [Spegel](https://github.com/spegel-org/spegel) and distributes the image peer-to-peer to every node, so it is downloaded from Docker Hub only once.
@@ -42,6 +42,41 @@ This repository contains a collection of shell scripts that automate the install
 - The scripts make changes to networking, firewall, and system configuration.
 - The VMs need hardware virtualization (`/dev/kvm`) on every node that runs them. Without it, KubeVirt can use software emulation, which is much slower.
 - A reboot after teardown is recommended to fully restore the machine.
+
+---
+
+## Pinned versions
+
+Every component is pinned in [`lib/versions.sh`](lib/versions.sh), the one place to change them:
+
+| Component | Version |
+|---|---|
+| Kubernetes (cgroup v2 hosts) | 1.36.6 |
+| Kubernetes (cgroup v1 hosts) | 1.34.13 |
+| containerd | 2.4.2 |
+| Cilium | 1.20.4 (CLI v0.20.2, Hubble CLI v1.20.2) |
+| KubeVirt | v1.9.1 |
+| Helm | v4.3.1 |
+| Spegel chart | 0.8.1 |
+
+The Kubernetes packages and containerd are locked at these versions: the `kubernetes` repo file and the `[docker-ce-stable]` section of `docker-ce.repo` each get an `exclude=` line, so a routine `dnf update` won't upgrade them. To upgrade on purpose, change `lib/versions.sh` or run `dnf` with `--disableexcludes=kubernetes` or `--disableexcludes=docker-ce-stable`.
+
+KubeVirt 1.9 and Cilium 1.20 both officially support Kubernetes 1.34 through 1.36, so both Kubernetes versions are within their tested range.
+
+### cgroup check
+
+Kubernetes 1.35 and newer refuse to start the kubelet on cgroup v1 by default, so the init scripts pick the release automatically with [`check-cgroup.sh`](check-cgroup.sh):
+
+- **cgroup v2**: Kubernetes 1.36
+- **cgroup v1 or hybrid**: Kubernetes 1.34, the last release that runs on cgroup v1 by default
+
+On multi-node setups every node is checked, and a single cgroup v1 node puts the whole cluster on 1.34, because all nodes must run the same release. To check a host before installing:
+
+```bash
+bash check-cgroup.sh
+```
+
+To move a RHEL-family host to cgroup v2, run `grubby --update-kernel=ALL --args="systemd.unified_cgroup_hierarchy=1"` and reboot.
 
 ---
 
@@ -71,7 +106,6 @@ You will be asked for:
 
 - a username to create (default `AIDEN`)
 - a password for that user (default `AIDEN#`)
-- the Kubernetes version to install (default `v1.33`)
 - the Pod network range (default `192.168.0.0/16`)
 - which network interface to use for the API server
 - the Cilium networking options (see [Cilium networking](#cilium-networking) below)
@@ -122,7 +156,7 @@ When a BGP peer is set, each node advertises its Pod CIDR and all LoadBalancer I
 
 To turn BGP on later, run `cilium upgrade --reuse-values --set bgpControlPlane.enabled=true`, restart the agents with `kubectl -n kube-system rollout restart ds/cilium deploy/cilium-operator`, then apply your own `CiliumBGPClusterConfig`, `CiliumBGPPeerConfig`, and `CiliumBGPAdvertisement`.
 
-The generated resources are saved in `/var/lib/aiden-lab/cilium-network.yaml`, and you can edit and re-apply that file later. Set `CILIUM_VERSION=1.x.y` to pin a release (1.16 or newer); the default is the latest stable.
+The generated resources are saved in `/var/lib/aiden-lab/cilium-network.yaml`, and you can edit and re-apply that file later. Set `CILIUM_VERSION=1.x.y` to override the pinned release (1.16 or newer).
 
 Useful commands:
 
@@ -149,7 +183,6 @@ sudo bash 1-kubevirt-setup.sh
 This script will:
 
 - check for `/dev/kvm` and, if it is missing, ask whether to enable software emulation
-- detect the latest KubeVirt release
 - install the KubeVirt operator and CRDs
 - install `virtctl`
 - pull the latest AIDEN Lab container image for the VMs into containerd (the only Docker Hub pull)
@@ -163,9 +196,9 @@ The AIDEN Lab disk image is large, so it is pulled from Docker Hub **once**, on 
 2. The init scripts configure containerd to read registry mirrors from `/etc/containerd/certs.d` and to keep layer blobs after unpacking (`discard_unpacked_layers = false`), so every node can serve what it has.
 3. A short-lived pre-warm DaemonSet makes every node pull the image. containerd asks Spegel first and downloads the layers from whichever peers already have them. Each node that finishes becomes another source, and Docker Hub is used only if no node has a layer.
 
-Nodes added to the cluster later get the image the same way. Set `SPEGEL_VERSION` to pin the Spegel chart version.
+Nodes added to the cluster later get the image the same way. Set `SPEGEL_VERSION` to override the pinned Spegel chart version.
 
-To skip the emulation prompt, set `KUBEVIRT_USE_EMULATION=true` or `false`. To pin a release, set `KUBEVIRT_VERSION=vX.Y.Z`.
+To skip the emulation prompt, set `KUBEVIRT_USE_EMULATION=true` or `false`. To override the pinned release, set `KUBEVIRT_VERSION=vX.Y.Z`.
 
 ### 3. Deploy one or more VMs
 
@@ -243,6 +276,8 @@ If no recorded state is found (for example, the machine was set up with an older
 | `0-init-singlenode.sh` | Single-node host and Kubernetes setup with Cilium networking |
 | `0-init-multinode.sh` | Control plane + 1–3 worker nodes setup with Cilium networking |
 | `1-kubevirt-setup.sh` | Install KubeVirt operator, CRDs, `virtctl`, and (multi-node) Spegel image distribution |
+| `check-cgroup.sh` | Detects cgroup v1/v2 and picks Kubernetes 1.36 or 1.34 (run alone or sourced by the init scripts) |
+| `lib/versions.sh` | All pinned component versions |
 | `lib/cilium.sh` | Shared Cilium install and network config, sourced by both init scripts |
 | `2-deploy-vms.sh` | Create VMs and NodePort services for RDP access |
 | `3-teardown.sh` | Clean up and restore the machine (and workers) after use |

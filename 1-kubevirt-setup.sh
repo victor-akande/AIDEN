@@ -5,6 +5,10 @@ echo "=========================================================="
 echo "⚙️  Phase 2: Provisioning KubeVirt & Image Tooling..."
 echo "=========================================================="
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/versions.sh
+source "$SCRIPT_DIR/lib/versions.sh"
+
 AIDEN_IMAGE="docker.io/victhedev/aiden:latest"
 AIDEN_STATE_DIR=/var/lib/aiden-lab
 export KUBECONFIG=${KUBECONFIG:-/etc/kubernetes/admin.conf}
@@ -38,19 +42,10 @@ fi
 
 NODE_COUNT=$(kubectl get nodes --no-headers | wc -l)
 
-# Resolve the latest KubeVirt release tag if not already provided.
-if [ -z "${KUBEVIRT_VERSION}" ]; then
-  echo "[1/7] Resolving latest KubeVirt release tag..."
-  KUBEVIRT_VERSION=$(curl -fsSL https://api.github.com/repos/kubevirt/kubevirt/releases/latest \
-    | grep -Eo '"tag_name":\s*"[^"]+"' \
-    | head -n1 \
-    | cut -d'"' -f4)
-  if [ -z "${KUBEVIRT_VERSION}" ]; then
-    echo "Failed to determine the latest KubeVirt release tag." >&2
-    exit 1
-  fi
-  export KUBEVIRT_VERSION
-fi
+# Pinned in lib/versions.sh; KUBEVIRT_VERSION in the environment overrides it.
+KUBEVIRT_VERSION=${KUBEVIRT_VERSION:-$AIDEN_KUBEVIRT_VERSION}
+export KUBEVIRT_VERSION
+echo "[1/7] Using KubeVirt ${KUBEVIRT_VERSION} on $NODE_COUNT node(s)"
 
 echo "[2/7] Deploying KubeVirt Operator..."
 kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml
@@ -93,12 +88,7 @@ if [ "$NODE_COUNT" -gt 1 ]; then
   # ==========================================================
   echo "[6/7] Installing Spegel (peer-to-peer image distribution, $NODE_COUNT nodes)..."
   if ! command -v helm >/dev/null 2>&1; then
-    HELM_VERSION=$(curl -fsSL https://api.github.com/repos/helm/helm/releases/latest \
-      | grep -Eo '"tag_name":\s*"[^"]+"' | head -n1 | cut -d'"' -f4)
-    if [ -z "$HELM_VERSION" ]; then
-      echo "Failed to determine the latest Helm release." >&2
-      exit 1
-    fi
+    HELM_VERSION=$AIDEN_HELM_VERSION
     echo "   -> Installing helm ${HELM_VERSION}..."
     HELM_TMP=$(mktemp -d)
     (
@@ -113,9 +103,9 @@ if [ "$NODE_COUNT" -gt 1 ]; then
     aiden_record_bin /usr/local/bin/helm
   fi
 
-  # SPEGEL_VERSION can pin the chart version (e.g. 0.8.1); default is latest.
+  # Chart version pinned in lib/versions.sh; SPEGEL_VERSION in the environment overrides it.
   helm upgrade --install spegel oci://ghcr.io/spegel-org/helm-charts/spegel \
-    ${SPEGEL_VERSION:+--version "$SPEGEL_VERSION"} \
+    --version "${SPEGEL_VERSION:-$AIDEN_SPEGEL_CHART_VERSION}" \
     --namespace spegel --create-namespace \
     --set spegel.containerdRegistryConfigPath=/etc/containerd/certs.d \
     --wait --timeout 10m
@@ -147,7 +137,7 @@ spec:
       terminationGracePeriodSeconds: 0
       initContainers:
       - name: tools
-        image: docker.io/library/busybox:1.36.1-musl
+        image: ${AIDEN_BUSYBOX_IMAGE}
         command: ["cp", "/bin/busybox", "/tools/busybox"]
         volumeMounts:
         - name: tools
@@ -161,7 +151,7 @@ spec:
           mountPath: /tools
       containers:
       - name: done
-        image: registry.k8s.io/pause:3.10
+        image: ${AIDEN_PAUSE_IMAGE}
       volumes:
       - name: tools
         emptyDir: {}

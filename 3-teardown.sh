@@ -78,7 +78,7 @@ kubeadm reset -f || true
 
 # 2. Remove K8s and Containerd packages
 echo "[2/9] Removing Kubernetes and Containerd packages..."
-dnf remove -y kubelet kubeadm kubectl containerd.io || true
+dnf remove -y --disableexcludes=all kubelet kubeadm kubectl containerd.io || true
 rm -rf /etc/yum.repos.d/kubernetes.repo /etc/yum.repos.d/docker-ce.repo
 
 # 3. Clean up Configuration Directories

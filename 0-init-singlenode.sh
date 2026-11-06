@@ -7,6 +7,8 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=check-cgroup.sh
+source "$SCRIPT_DIR/check-cgroup.sh"   # also loads lib/versions.sh
 # shellcheck source=lib/cilium.sh
 source "$SCRIPT_DIR/lib/cilium.sh"
 
@@ -27,9 +29,6 @@ NEW_USER=${NEW_USER:-AIDEN}
 read -s -p "Enter password for user '$NEW_USER' [AIDEN#]: " NEW_USER_PASS
 echo ""
 NEW_USER_PASS=${NEW_USER_PASS:-AIDEN#}
-
-read -p "Enter Kubernetes Version (e.g., v1.29, v1.30, v1.31) [v1.33]: " K8S_VERSION
-K8S_VERSION=${K8S_VERSION:-v1.33}
 
 read -p "Enter Pod Network CIDR [192.168.0.0/16]: " POD_CIDR
 POD_CIDR=${POD_CIDR:-192.168.0.0/16}
@@ -57,6 +56,15 @@ SELECTED_IP=$(echo "$SELECTED_IP_CIDR" | cut -d'/' -f1)
 echo "-> Selected Interface: $SELECTED_IFACE (IP: $SELECTED_IP)"
 
 cilium_prompt
+
+echo ""
+echo "--- 🔎 cgroup Check ---"
+CGROUP_VERSION=$(aiden_cgroup_version)
+aiden_select_k8s_version "$CGROUP_VERSION"
+echo "-> cgroup v${CGROUP_VERSION}: installing Kubernetes ${K8S_PATCH}"
+if [ "$CGROUP_VERSION" = "1" ]; then
+  aiden_cgroup_v1_notice
+fi
 
 echo "----------------------------------------------------------"
 echo "Configuration gathered. Starting infrastructure build..."
@@ -128,11 +136,20 @@ echo "[4/8] Installing Containerd..."
 dnf install -y dnf-plugins-core
 yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo
-dnf install -y containerd.io
+dnf install -y "containerd.io-${AIDEN_CONTAINERD_VERSION}" --disableexcludes=docker-ce-stable
+# Lock containerd at the pinned version: exclude it from the Docker repo so a
+# routine 'dnf update' cannot upgrade it (3-teardown.sh removes this repo file).
+grep -q '^exclude=containerd.io' /etc/yum.repos.d/docker-ce.repo \
+  || sed -i '/^\[docker-ce-stable\]$/a exclude=containerd.io' /etc/yum.repos.d/docker-ce.repo
 
-# Configure containerd to use Systemd Cgroup (Crucial for stability)
+# Configure containerd to use Systemd Cgroup (Crucial for stability).
+# containerd 2.x's generated default may omit the key, so add it when missing.
 containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+if grep -q 'SystemdCgroup' /etc/containerd/config.toml; then
+  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+else
+  sed -i -E '/runtimes\.runc\.options\][[:space:]]*$/a\            SystemdCgroup = true' /etc/containerd/config.toml
+fi
 # Read per-registry mirror config from certs.d (used by Spegel on multi-node clusters)
 # and keep layer blobs after unpacking so images can be served to peers.
 sed -i -E "/\.registry\]\$/,/^[[:space:]]*\[/ s#^([[:space:]]*config_path = )(\"\"|'')#\1\"/etc/containerd/certs.d\"#" /etc/containerd/config.toml
@@ -142,7 +159,8 @@ systemctl enable --now containerd
 systemctl restart containerd
 
 # 5. Add Kubernetes Repository & Install Components
-echo "[5/8] Installing Kubeadm, Kubelet, and Kubectl ($K8S_VERSION)..."
+echo "[5/8] Installing Kubeadm, Kubelet, and Kubectl ($K8S_PATCH)..."
+# The exclude line stops a routine 'dnf update' from upgrading Kubernetes.
 cat <<EOF > /etc/yum.repos.d/kubernetes.repo
 [kubernetes]
 name=Kubernetes
@@ -150,14 +168,17 @@ baseurl=https://pkgs.k8s.io/core:/stable:/$K8S_VERSION/rpm/
 enabled=1
 gpgcheck=1
 gpgkey=https://pkgs.k8s.io/core:/stable:/$K8S_VERSION/rpm/repodata/repomd.xml.key
+exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
 
-dnf install -y kubelet kubeadm kubectl
+dnf install -y "kubelet-${K8S_PATCH}" "kubeadm-${K8S_PATCH}" "kubectl-${K8S_PATCH}" \
+  --disableexcludes=kubernetes
 systemctl enable --now kubelet
 
 # 6. Initialize Kubernetes Cluster
 echo "[6/8] Initializing Single-Node Control Plane (without kube-proxy; Cilium replaces it)..."
 kubeadm init \
+  --kubernetes-version="v${K8S_PATCH}" \
   --skip-phases=addon/kube-proxy \
   --cri-socket unix:///var/run/containerd/containerd.sock \
   --pod-network-cidr="$POD_CIDR" \
