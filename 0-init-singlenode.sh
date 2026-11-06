@@ -6,8 +6,12 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cilium.sh
+source "$SCRIPT_DIR/lib/cilium.sh"
+
 echo "=========================================================="
-echo "🚀 Initiating Interactive Kubernetes & Calico Build"
+echo "🚀 Initiating Interactive Kubernetes & Cilium Build"
 echo "=========================================================="
 
 # ==========================================================
@@ -51,6 +55,8 @@ SELECTED_IP_CIDR=$(echo "$SELECTED_INT_INFO" | cut -d':' -f2)
 SELECTED_IP=$(echo "$SELECTED_IP_CIDR" | cut -d'/' -f1)
 
 echo "-> Selected Interface: $SELECTED_IFACE (IP: $SELECTED_IP)"
+
+cilium_prompt
 
 echo "----------------------------------------------------------"
 echo "Configuration gathered. Starting infrastructure build..."
@@ -144,8 +150,9 @@ dnf install -y kubelet kubeadm kubectl
 systemctl enable --now kubelet
 
 # 6. Initialize Kubernetes Cluster
-echo "[6/8] Initializing Single-Node Control Plane..."
+echo "[6/8] Initializing Single-Node Control Plane (without kube-proxy; Cilium replaces it)..."
 kubeadm init \
+  --skip-phases=addon/kube-proxy \
   --cri-socket unix:///var/run/containerd/containerd.sock \
   --pod-network-cidr="$POD_CIDR" \
   --apiserver-advertise-address="$SELECTED_IP"
@@ -165,20 +172,12 @@ echo "[7/8] Removing control-plane taint for single-node operation..."
 export KUBECONFIG=/etc/kubernetes/admin.conf
 kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
 
-# 8. Install Calico CNI
-echo "[8/8] Installing Calico CNI..."
-CALICO_VERSION=$(curl -fsSL https://api.github.com/repos/projectcalico/calico/releases/latest \
-  | grep -Eo '"tag_name":\s*"[^"]+"' \
-  | head -n1 \
-  | cut -d'"' -f4)
-if [ -z "${CALICO_VERSION}" ]; then
-  echo "Failed to resolve latest Calico release." >&2
-  exit 1
-fi
-
-kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml
+# 8. Install Cilium CNI (single node: one operator replica)
+echo "[8/8] Installing Cilium CNI..."
+cilium_install "$SELECTED_IP" 1
 
 echo "=========================================================="
 echo "✅ Infrastructure layer successfully provisioned!"
+cilium_print_summary
 echo "Run 'kubectl get nodes -w' to watch your node become Ready."
 echo "=========================================================="

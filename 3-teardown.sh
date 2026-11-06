@@ -93,17 +93,28 @@ rm -rf /home/*/.kube/
 rm -rf /etc/cni/net.d/
 rm -rf /var/lib/cni/
 rm -rf /var/lib/calico/
+rm -rf /var/run/cilium/ /run/cilium/
+rm -f /opt/cni/bin/cilium-cni
+# Cilium's pinned BPF maps/programs (bpffs is not persistent; a reboot also clears these)
+rm -rf /sys/fs/bpf/cilium /sys/fs/bpf/tc/globals/cilium_* 2>/dev/null || true
 
 # 4. Remove Binary Tools
-echo "[4/9] Removing virtctl..."
+echo "[4/9] Removing virtctl and tools installed by setup (cilium, hubble)..."
 rm -f /usr/local/bin/virtctl
+if [ -f "$STATE_DIR/installed-bins" ]; then
+  while read -r BIN; do
+    case "$BIN" in
+      /usr/local/bin/*) rm -f "$BIN" && echo "   removed $BIN" ;;
+    esac
+  done < "$STATE_DIR/installed-bins"
+fi
 
 # 5. Restore Network Interfaces & Iptables
 echo "[5/9] Cleaning up networking (IPVS/Iptables)..."
 iptables -F && iptables -t nat -F && iptables -t mangle -F && iptables -X
 # Delete CNI interfaces one by one (`ip link delete` takes a single name, no globs)
 for LINK in $(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 \
-              | grep -E '^(cali.+|tunl0|vxlan\.calico|cni0|flannel\.1)$' || true); do
+              | grep -E '^(cilium_host|cilium_net|cilium_vxlan|cilium_geneve|lxc.+|cali.+|tunl0|vxlan\.calico|cni0|flannel\.1)$' || true); do
   ip link delete "$LINK" 2>/dev/null || true
 done
 

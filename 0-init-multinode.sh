@@ -6,6 +6,10 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/cilium.sh
+source "$SCRIPT_DIR/lib/cilium.sh"
+
 echo -e "\e[32m==========================================================\e[0m"
 echo -e "\e[32m🚀 Initiating Interactive Multi-Node Kubernetes Build\e[0m"
 echo -e "\e[32m==========================================================\e[0m"
@@ -62,6 +66,9 @@ for (( i=1; i<=WORKER_COUNT; i++ )); do
     WORKER_IPS+=("$W_IP")
     WORKER_HOSTS+=("$W_HOST")
 done
+
+echo ""
+cilium_prompt
 
 echo ""
 echo -e "\e[33m--- 🔑 SSH Credentials ---\e[0m"
@@ -227,8 +234,9 @@ done
 # ==========================================================
 # 4. Initialize Kubernetes Cluster
 # ==========================================================
-echo -e "\e[32m[4/7] Initializing Control Plane...\e[0m"
+echo -e "\e[32m[4/7] Initializing Control Plane (without kube-proxy; Cilium replaces it)...\e[0m"
 kubeadm init \
+  --skip-phases=addon/kube-proxy \
   --cri-socket unix:///var/run/containerd/containerd.sock \
   --pod-network-cidr="$POD_CIDR" \
   --apiserver-advertise-address="$SELECTED_IP"
@@ -261,20 +269,11 @@ for (( i=0; i<WORKER_COUNT; i++ )); do
 done
 
 # ==========================================================
-# 6. Install Calico CNI
+# 6. Install Cilium CNI
 # ==========================================================
-echo -e "\e[32m[6/7] Installing Calico CNI...\e[0m"
-CALICO_VERSION=$(curl -fsSL https://api.github.com/repos/projectcalico/calico/releases/latest \
-  | grep -Eo '"tag_name":\s*"[^"]+"' \
-  | head -n1 \
-  | cut -d'"' -f4)
-
-if [ -z "${CALICO_VERSION}" ]; then
-  echo "Failed to resolve latest Calico release. Deploying fallback version."
-  kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
-else
-  kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml
-fi
+echo -e "\e[32m[6/7] Installing Cilium CNI...\e[0m"
+# Two operator replicas for HA now that there is more than one node
+cilium_install "$SELECTED_IP" 2
 
 # ==========================================================
 # 7. Cleanup & Finalization
@@ -285,6 +284,7 @@ unset SSH_PASSWORD
 
 echo -e "\e[32m==========================================================\e[0m"
 echo -e "\e[32m✅ Multi-Node Infrastructure successfully provisioned!\e[0m"
-echo -e "Wait a few moments for Calico pods to start, then run:"
+cilium_print_summary
+echo -e "Check that all nodes are Ready:"
 echo -e "  \e[36mkubectl get nodes -w\e[0m"
 echo -e "\e[32m==========================================================\e[0m"
