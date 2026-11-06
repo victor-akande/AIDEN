@@ -99,7 +99,7 @@ rm -f /opt/cni/bin/cilium-cni
 rm -rf /sys/fs/bpf/cilium /sys/fs/bpf/tc/globals/cilium_* 2>/dev/null || true
 
 # 4. Remove Binary Tools
-echo "[4/9] Removing virtctl and tools installed by setup (cilium, hubble)..."
+echo "[4/9] Removing virtctl and tools installed by setup (cilium, hubble, helm)..."
 rm -f /usr/local/bin/virtctl
 if [ -f "$STATE_DIR/installed-bins" ]; then
   while read -r BIN; do

@@ -133,7 +133,13 @@ dnf install -y containerd.io
 # Configure containerd to use Systemd Cgroup (Crucial for stability)
 containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+# Read per-registry mirror config from certs.d (used by Spegel on multi-node clusters)
+# and keep layer blobs after unpacking so images can be served to peers.
+sed -i -E "/\.registry\]\$/,/^[[:space:]]*\[/ s#^([[:space:]]*config_path = )(\"\"|'')#\1\"/etc/containerd/certs.d\"#" /etc/containerd/config.toml
+sed -i 's/discard_unpacked_layers = true/discard_unpacked_layers = false/' /etc/containerd/config.toml
+mkdir -p /etc/containerd/certs.d
 systemctl enable --now containerd
+systemctl restart containerd
 
 # 5. Add Kubernetes Repository & Install Components
 echo "[5/8] Installing Kubeadm, Kubelet, and Kubectl ($K8S_VERSION)..."

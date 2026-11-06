@@ -22,6 +22,7 @@ This repository contains a collection of shell scripts that automate the install
   - Installs the latest KubeVirt operator and custom resources.
   - Downloads and installs the `virtctl` tool.
   - Pulls the custom AIDEN Lab disk image into the containerd image store.
+  - On multi-node clusters, installs [Spegel](https://github.com/spegel-org/spegel) and distributes the image peer-to-peer to every node, so it is downloaded from Docker Hub only once.
 
 - `2-deploy-vms.sh`
   - Deploys one or more AIDEN Lab instances in the Kubernetes cluster using KubeVirt.
@@ -141,7 +142,18 @@ This script will:
 - detect the latest KubeVirt release
 - install the KubeVirt operator and CRDs
 - install `virtctl`
-- pull the latest AIDEN Lab container image for the VMs into containerd
+- pull the latest AIDEN Lab container image for the VMs into containerd (the only Docker Hub pull)
+- on multi-node clusters: install Spegel and pre-warm the image on every node
+
+#### How the image is distributed (multi-node)
+
+The AIDEN Lab disk image is large, so it is pulled from Docker Hub **once**, on the control plane. Every other node gets it over the node network:
+
+1. [Spegel](https://github.com/spegel-org/spegel) runs on every node as a small DaemonSet. It serves the images in each node's containerd store to the other nodes.
+2. The init scripts configure containerd to read registry mirrors from `/etc/containerd/certs.d` and to keep layer blobs after unpacking (`discard_unpacked_layers = false`), so every node can serve what it has.
+3. A short-lived pre-warm DaemonSet makes every node pull the image. containerd asks Spegel first and downloads the layers from whichever peers already have them. Each node that finishes becomes another source, and Docker Hub is used only if no node has a layer.
+
+Nodes added to the cluster later get the image the same way. Set `SPEGEL_VERSION` to pin the Spegel chart version.
 
 To skip the emulation prompt, set `KUBEVIRT_USE_EMULATION=true` or `false`. To pin a release, set `KUBEVIRT_VERSION=vX.Y.Z`.
 
@@ -179,7 +191,7 @@ This script will:
 - reset the Kubernetes cluster
 - remove installed packages and configuration files
 - clean up network changes (iptables rules, Cilium/CNI interfaces, and BPF state)
-- remove the `cilium` and `hubble` CLIs, but only those the setup installed
+- remove the `cilium`, `hubble`, and `helm` CLIs, but only those the setup installed
 - re-enable exactly the swap entries that setup disabled
 - restore SELinux and firewalld to their original state (they are **not** forced on if they were off before setup)
 - optionally delete the user created during setup
@@ -207,6 +219,7 @@ If no recorded state is found (for example, the machine was set up with an older
 - If VMs stay in `Scheduling` or fail to start, check that `/dev/kvm` exists on the nodes, or re-run `1-kubevirt-setup.sh` with `KUBEVIRT_USE_EMULATION=true`.
 - If pods cannot reach services, run `cilium status` and `cilium connectivity test`.
 - If BGP sessions do not come up, check `cilium bgp peers` and make sure your router is configured to peer with every node IP.
+- If a node is slow to receive the image, check the Spegel pods with `kubectl -n spegel get pods -o wide` and their logs.
 - If `kubectl` cannot connect after setup, ensure the Kubernetes control plane is up and `kubectl` is using `/etc/kubernetes/admin.conf`.
 
 ---
@@ -217,7 +230,7 @@ If no recorded state is found (for example, the machine was set up with an older
 |------|---------|
 | `0-init-singlenode.sh` | Single-node host and Kubernetes setup with Cilium networking |
 | `0-init-multinode.sh` | Control plane + 1–3 worker nodes setup with Cilium networking |
-| `1-kubevirt-setup.sh` | Install KubeVirt operator, CRDs, and `virtctl` |
+| `1-kubevirt-setup.sh` | Install KubeVirt operator, CRDs, `virtctl`, and (multi-node) Spegel image distribution |
 | `lib/cilium.sh` | Shared Cilium install and network config, sourced by both init scripts |
 | `2-deploy-vms.sh` | Create VMs and NodePort services for RDP access |
 | `3-teardown.sh` | Clean up and restore the machine (and workers) after use |

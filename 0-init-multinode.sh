@@ -179,7 +179,13 @@ sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo
 dnf install -y containerd.io
 containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+# Read per-registry mirror config from certs.d (Spegel P2P image distribution)
+# and keep layer blobs after unpacking so this node can serve images to peers.
+sed -i -E "/\.registry\]\$/,/^[[:space:]]*\[/ s#^([[:space:]]*config_path = )(\"\"|'')#\1\"/etc/containerd/certs.d\"#" /etc/containerd/config.toml
+sed -i 's/discard_unpacked_layers = true/discard_unpacked_layers = false/' /etc/containerd/config.toml
+mkdir -p /etc/containerd/certs.d
 systemctl enable --now containerd
+systemctl restart containerd
 EOF
 
 # Append Kubernetes Repositories (with dynamic version)
