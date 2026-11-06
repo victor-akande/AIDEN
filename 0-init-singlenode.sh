@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+if [ "$EUID" -ne 0 ]; then
+  echo -e "\e[31mError: Please run this script as root.\e[0m"
+  exit 1
+fi
+
 echo "=========================================================="
 echo "🚀 Initiating Interactive Kubernetes & Calico Build"
 echo "=========================================================="
@@ -15,8 +20,9 @@ echo "Press [ENTER] to accept the default values."
 read -p "Enter username for new sudo user [AIDEN]: " NEW_USER
 NEW_USER=${NEW_USER:-AIDEN}
 
-read -p "Enter password for user '$NEW_USER' [AIDEN#]: " NEW_USER_PASS
-NEW_USER_PASS=${NEW_USER_PASS:-AIDEN}
+read -s -p "Enter password for user '$NEW_USER' [AIDEN#]: " NEW_USER_PASS
+echo ""
+NEW_USER_PASS=${NEW_USER_PASS:-AIDEN#}
 
 read -p "Enter Kubernetes Version (e.g., v1.29, v1.30, v1.31) [v1.33]: " K8S_VERSION
 K8S_VERSION=${K8S_VERSION:-v1.33}
@@ -51,6 +57,27 @@ echo "Configuration gathered. Starting infrastructure build..."
 echo "----------------------------------------------------------"
 echo ""
 
+# ==========================================================
+# Record the original system state (used by 3-teardown.sh)
+# Only written once, so re-running this script never overwrites
+# the true original values with already-modified ones.
+# ==========================================================
+STATE_DIR=/var/lib/aiden-lab
+STATE_FILE=$STATE_DIR/state
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+if [ ! -f "$STATE_FILE" ]; then
+  {
+    echo "ORIG_SELINUX_RUNTIME=$(getenforce 2>/dev/null || echo Disabled)"
+    echo "ORIG_SELINUX_CONFIG=$(grep -E '^SELINUX=' /etc/selinux/config 2>/dev/null | cut -d= -f2)"
+    echo "ORIG_FIREWALLD_ENABLED=$(systemctl is-enabled firewalld 2>/dev/null || true)"
+    echo "ORIG_FIREWALLD_ACTIVE=$(systemctl is-active firewalld 2>/dev/null || true)"
+  } > "$STATE_FILE"
+  cp -a /etc/fstab "$STATE_DIR/fstab.orig"
+  echo "Original system state recorded in $STATE_FILE"
+fi
+echo "AIDEN_USER=$NEW_USER" > "$STATE_DIR/user"
+
 # Create configured user with home directory
 useradd -m "$NEW_USER" || true # Avoid failing if user already exists
 echo "$NEW_USER:$NEW_USER_PASS" | chpasswd
@@ -60,7 +87,8 @@ echo "User '$NEW_USER' configured and granted sudo privileges."
 # 1. Disable Swap (Kubelet requirement)
 echo "[1/8] Disabling Swap..."
 swapoff -a
-sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+# Tag the lines we comment out so teardown re-enables exactly these lines
+sed -i -E '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#AIDEN# /' /etc/fstab
 
 # 2. Disable SELinux & Firewall (Required for standard K8s networking)
 echo "[2/8] Permissing SELinux and disabling Firewalld..."
@@ -76,7 +104,6 @@ br_netfilter
 EOF
 modprobe overlay
 modprobe br_netfilter
-mkdir -p /disk
 
 cat <<EOF > /etc/sysctl.d/k8s.conf
 net.bridge.bridge-nf-call-iptables  = 1
@@ -92,6 +119,7 @@ fi
 # 4. Install Containerd
 echo "[4/8] Installing Containerd..."
 # Add the repository that provides containerd.io
+dnf install -y dnf-plugins-core
 yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo
 dnf install -y containerd.io
@@ -120,8 +148,7 @@ echo "[6/8] Initializing Single-Node Control Plane..."
 kubeadm init \
   --cri-socket unix:///var/run/containerd/containerd.sock \
   --pod-network-cidr="$POD_CIDR" \
-  --apiserver-advertise-address="$SELECTED_IP" \
-  --v=9
+  --apiserver-advertise-address="$SELECTED_IP"
 
 # Configure kubectl for root
 mkdir -p /root/.kube

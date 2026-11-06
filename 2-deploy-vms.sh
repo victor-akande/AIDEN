@@ -18,18 +18,40 @@ VM_CORES=${VM_CORES:-2}
 read -p "Enter VM Name Prefix [aiden-labs]: " VM_PREFIX
 VM_PREFIX=${VM_PREFIX:-aiden-labs}
 
-# 2. Configuration 
+read -p "Enter starting RDP NodePort (30000-32767) [30001]: " START_PORT
+START_PORT=${START_PORT:-30001}
+if ! [[ "$START_PORT" =~ ^[0-9]+$ ]] || [ "$START_PORT" -lt 30000 ] || [ "$START_PORT" -gt 32767 ]; then
+  echo "Starting port must be a number between 30000 and 32767." >&2
+  exit 1
+fi
+
+# 2. Configuration
 IMAGE_NAME="docker.io/victhedev/aiden:latest"
-IMAGE_PATH="/disk/disk.qcow2" 
+IMAGE_PATH="/disk/disk.qcow2"   # path inside the container image
 USERNAME="AIDEN"
 PASSWORD="AIDEN"
-MANIFEST_FILE="temp_vms.yaml"
+MANIFEST_FILE=$(mktemp /tmp/aiden-vms.XXXXXX.yaml)
+trap 'rm -f "$MANIFEST_FILE"' EXIT
 
 # Get Node IP for the final summary
 NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 
-# Clean up temp file
-> "$MANIFEST_FILE"
+# Live migration needs at least two nodes that can run VMs. On a single
+# schedulable node, LiveMigrate would block node drains forever.
+SCHEDULABLE_NODES=$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.taints[*].effect}{"\n"}{end}' \
+  | grep -vc NoSchedule || true)
+if [ "${SCHEDULABLE_NODES:-0}" -ge 2 ]; then
+  EVICTION_STRATEGY="LiveMigrate"
+else
+  EVICTION_STRATEGY="None"
+fi
+echo "-> Schedulable nodes: ${SCHEDULABLE_NODES:-0} (evictionStrategy: $EVICTION_STRATEGY)"
+
+# NodePorts already taken anywhere in the cluster
+USED_PORTS=" $(kubectl get svc -A -o jsonpath='{range .items[*]}{.spec.ports[*].nodePort}{" "}{end}') "
+
+declare -a VM_PORTS
+NEXT_PORT=$START_PORT
 
 echo "Generating batch manifest for $VM_COUNT VMs..."
 
@@ -37,7 +59,24 @@ echo "Generating batch manifest for $VM_COUNT VMs..."
 for ((i=1; i<=VM_COUNT; i++))
 do
   VM_NAME="${VM_PREFIX}-${i}"
-  NODE_PORT=$((30000 + i))
+
+  # Reuse the port if this VM's service already exists (re-run/update),
+  # otherwise take the next free port.
+  EXISTING_PORT=$(kubectl get svc "${VM_NAME}-rdp" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
+  if [ -n "$EXISTING_PORT" ]; then
+    NODE_PORT=$EXISTING_PORT
+  else
+    while [[ "$USED_PORTS" == *" $NEXT_PORT "* ]]; do
+      NEXT_PORT=$((NEXT_PORT + 1))
+    done
+    if [ "$NEXT_PORT" -gt 32767 ]; then
+      echo "Ran out of free NodePorts in the 30000-32767 range." >&2
+      exit 1
+    fi
+    NODE_PORT=$NEXT_PORT
+    USED_PORTS="$USED_PORTS$NODE_PORT "
+  fi
+  VM_PORTS+=("$NODE_PORT")
 
   cat <<EOF >> "$MANIFEST_FILE"
 apiVersion: kubevirt.io/v1
@@ -47,14 +86,14 @@ metadata:
   labels:
     app: ${VM_PREFIX}
 spec:
-  running: true
+  runStrategy: Always
   template:
     metadata:
       labels:
         kubevirt.io/domain: ${VM_NAME}
         app: ${VM_PREFIX}
     spec:
-      evictionStrategy: LiveMigrate
+      evictionStrategy: ${EVICTION_STRATEGY}
       domain:
         cpu:
           cores: ${VM_CORES}
@@ -105,7 +144,6 @@ done
 # 4. Deploy
 echo "Applying manifests..."
 kubectl apply -f "$MANIFEST_FILE"
-rm "$MANIFEST_FILE"
 
 echo "=========================================================="
 echo "✅ Deployment Complete!"
@@ -115,6 +153,6 @@ echo "----------------------------------------------------------"
 echo "RDP Credentials: $USERNAME / $PASSWORD"
 for ((i=1; i<=VM_COUNT; i++))
 do
-  echo "  - ${VM_PREFIX}-${i} -> ${NODE_IP}:$((30000 + i))"
+  echo "  - ${VM_PREFIX}-${i} -> ${NODE_IP}:${VM_PORTS[$((i-1))]}"
 done
 echo "=========================================================="

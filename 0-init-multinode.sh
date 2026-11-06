@@ -20,7 +20,8 @@ echo "Press [ENTER] to accept the default values."
 read -p "Enter username for new sudo user [AIDEN]: " NEW_USER
 NEW_USER=${NEW_USER:-AIDEN}
 
-read -p "Enter password for user '$NEW_USER' [AIDEN#]: " NEW_USER_PASS
+read -s -p "Enter password for user '$NEW_USER' [AIDEN#]: " NEW_USER_PASS
+echo ""
 NEW_USER_PASS=${NEW_USER_PASS:-AIDEN#}
 
 read -p "Enter Kubernetes Version (e.g., v1.29, v1.30, v1.31) [v1.33]: " K8S_VERSION
@@ -64,7 +65,8 @@ done
 
 echo ""
 echo -e "\e[33m--- 🔑 SSH Credentials ---\e[0m"
-read -p "Enter the SSH (root) password for the worker nodes: " SSH_PASSWORD
+read -s -p "Enter the SSH (root) password for the worker nodes: " SSH_PASSWORD
+echo ""
 
 echo "----------------------------------------------------------"
 echo "Configuration gathered. Starting infrastructure build..."
@@ -73,6 +75,39 @@ echo ""
 
 # Ensure expect is installed locally for remote automation
 dnf install -y expect dnf-plugins-core >/dev/null 2>&1
+
+# Private working directory for generated scripts; removed on exit.
+WORK_DIR=$(mktemp -d /tmp/aiden-lab.XXXXXX)
+chmod 700 "$WORK_DIR"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+LOG_DIR=/var/log/aiden-lab
+mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
+
+# Generic expect wrapper: runs the given command, answers password prompts.
+# The password is read from the environment, never written to disk.
+EXP_SCRIPT="$WORK_DIR/run_with_password.exp"
+cat > "$EXP_SCRIPT" <<'EOF'
+#!/usr/bin/expect -f
+set timeout -1
+set pass $env(AIDEN_SSH_PASS)
+spawn {*}$argv
+expect {
+    -re "(?i)password:" { send -- "$pass\r"; exp_continue }
+    eof
+}
+lassign [wait] pid spawnid os_error value
+exit $value
+EOF
+chmod 600 "$EXP_SCRIPT"
+
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
+
+# Usage: with_password <command...>
+with_password() {
+    AIDEN_SSH_PASS="$SSH_PASSWORD" expect -f "$EXP_SCRIPT" "$@"
+}
 
 # Create configured user
 useradd -m "$NEW_USER" || true
@@ -85,13 +120,29 @@ echo "User '$NEW_USER' configured locally."
 # ==========================================================
 echo -e "\e[32m[1/7] Generating shared system preparation script...\e[0m"
 
-cat << 'EOF' > /tmp/k8s_prep.sh
+PREP_SCRIPT="$WORK_DIR/k8s_prep.sh"
+cat << 'EOF' > "$PREP_SCRIPT"
 #!/bin/bash
 set -e
 
-# Disable Swap
+# Record the original system state (used by 3-teardown.sh). Written once only.
+STATE_DIR=/var/lib/aiden-lab
+STATE_FILE=$STATE_DIR/state
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+if [ ! -f "$STATE_FILE" ]; then
+  {
+    echo "ORIG_SELINUX_RUNTIME=$(getenforce 2>/dev/null || echo Disabled)"
+    echo "ORIG_SELINUX_CONFIG=$(grep -E '^SELINUX=' /etc/selinux/config 2>/dev/null | cut -d= -f2)"
+    echo "ORIG_FIREWALLD_ENABLED=$(systemctl is-enabled firewalld 2>/dev/null || true)"
+    echo "ORIG_FIREWALLD_ACTIVE=$(systemctl is-active firewalld 2>/dev/null || true)"
+  } > "$STATE_FILE"
+  cp -a /etc/fstab "$STATE_DIR/fstab.orig"
+fi
+
+# Disable Swap (tag commented lines so teardown restores exactly these)
 swapoff -a
-sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+sed -i -E '/^[^#].*[[:space:]]swap[[:space:]]/ s/^/#AIDEN# /' /etc/fstab
 
 # Disable SELinux & Firewall
 setenforce 0 || true
@@ -115,6 +166,7 @@ sysctl --system
 sysctl -w net.ipv4.ip_forward=1
 
 # Install Containerd
+dnf install -y dnf-plugins-core
 yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
 sed -i 's/\$releasever/9/g' /etc/yum.repos.d/docker-ce.repo
 dnf install -y containerd.io
@@ -124,7 +176,7 @@ systemctl enable --now containerd
 EOF
 
 # Append Kubernetes Repositories (with dynamic version)
-cat << EOF >> /tmp/k8s_prep.sh
+cat << EOF >> "$PREP_SCRIPT"
 cat << 'IEOF' > /etc/yum.repos.d/kubernetes.repo
 [kubernetes]
 name=Kubernetes
@@ -137,13 +189,21 @@ dnf install -y kubelet kubeadm kubectl
 systemctl enable --now kubelet
 EOF
 
-chmod +x /tmp/k8s_prep.sh
+chmod 700 "$PREP_SCRIPT"
 
 # ==========================================================
 # 2. Prepare Local System (Control Plane)
 # ==========================================================
 echo -e "\e[32m[2/7] Executing system prep on local Control Plane...\e[0m"
-bash /tmp/k8s_prep.sh
+bash "$PREP_SCRIPT"
+echo "AIDEN_USER=$NEW_USER" > /var/lib/aiden-lab/user
+
+# Record the workers so 3-teardown.sh can clean them up too
+: > /var/lib/aiden-lab/workers
+chmod 600 /var/lib/aiden-lab/workers
+for (( i=0; i<WORKER_COUNT; i++ )); do
+    echo "${WORKER_IPS[$i]} ${WORKER_HOSTS[$i]}" >> /var/lib/aiden-lab/workers
+done
 
 # ==========================================================
 # 3. Prepare Remote Systems (Worker Nodes)
@@ -153,33 +213,15 @@ echo -e "\e[32m[3/7] Executing system prep on Worker Nodes...\e[0m"
 for (( i=0; i<WORKER_COUNT; i++ )); do
     W_IP=${WORKER_IPS[$i]}
     W_HOST=${WORKER_HOSTS[$i]}
-    echo "  -> Preparing $W_HOST ($W_IP)..."
+    W_LOG="$LOG_DIR/prep-$W_HOST.log"
+    echo "  -> Preparing $W_HOST ($W_IP)... (log: $W_LOG)"
 
-cat > /tmp/prep_remote.exp <<EOF
-#!/usr/bin/expect
-set timeout -1
-
-spawn ssh -o StrictHostKeyChecking=no root@$W_IP "hostnamectl set-hostname $W_HOST"
-expect {
-    "password:" { send "$SSH_PASSWORD\r"; exp_continue }
-    eof
-}
-
-spawn scp -o StrictHostKeyChecking=no /tmp/k8s_prep.sh root@$W_IP:/tmp/k8s_prep.sh
-expect {
-    "password:" { send "$SSH_PASSWORD\r"; exp_continue }
-    eof
-}
-
-spawn ssh -o StrictHostKeyChecking=no root@$W_IP "bash /tmp/k8s_prep.sh"
-expect {
-    "password:" { send "$SSH_PASSWORD\r"; exp_continue }
-    eof
-}
-EOF
-    chmod +x /tmp/prep_remote.exp
-    /tmp/prep_remote.exp > /dev/null
-    rm -f /tmp/prep_remote.exp
+    {
+      # Chained with && because set -e does not apply inside a "{ } ||" group
+      with_password ssh "${SSH_OPTS[@]}" root@"$W_IP" "hostnamectl set-hostname $W_HOST" &&
+      with_password scp "${SSH_OPTS[@]}" "$PREP_SCRIPT" root@"$W_IP":/root/aiden_k8s_prep.sh &&
+      with_password ssh "${SSH_OPTS[@]}" root@"$W_IP" "bash /root/aiden_k8s_prep.sh && rm -f /root/aiden_k8s_prep.sh"
+    } > "$W_LOG" 2>&1 || { echo -e "\e[31mPreparation of $W_HOST failed. See $W_LOG\e[0m"; exit 1; }
 done
 
 # ==========================================================
@@ -211,21 +253,11 @@ JOIN_CMD=$(kubeadm token create --print-join-command)
 for (( i=0; i<WORKER_COUNT; i++ )); do
     W_IP=${WORKER_IPS[$i]}
     W_HOST=${WORKER_HOSTS[$i]}
-    echo "  -> Joining $W_HOST ($W_IP)..."
+    W_LOG="$LOG_DIR/join-$W_HOST.log"
+    echo "  -> Joining $W_HOST ($W_IP)... (log: $W_LOG)"
 
-cat > /tmp/join_remote.exp <<EOF
-#!/usr/bin/expect
-set timeout -1
-
-spawn ssh -o StrictHostKeyChecking=no root@$W_IP "$JOIN_CMD"
-expect {
-    "password:" { send "$SSH_PASSWORD\r"; exp_continue }
-    eof
-}
-EOF
-    chmod +x /tmp/join_remote.exp
-    /tmp/join_remote.exp > /dev/null
-    rm -f /tmp/join_remote.exp
+    with_password ssh "${SSH_OPTS[@]}" root@"$W_IP" "$JOIN_CMD" > "$W_LOG" 2>&1 \
+      || { echo -e "\e[31mJoining $W_HOST failed. See $W_LOG\e[0m"; exit 1; }
 done
 
 # ==========================================================
@@ -248,7 +280,8 @@ fi
 # 7. Cleanup & Finalization
 # ==========================================================
 echo -e "\e[32m[7/7] Cleaning up temporary files...\e[0m"
-rm -f /tmp/k8s_prep.sh
+# WORK_DIR (generated scripts) is removed automatically by the EXIT trap.
+unset SSH_PASSWORD
 
 echo -e "\e[32m==========================================================\e[0m"
 echo -e "\e[32m✅ Multi-Node Infrastructure successfully provisioned!\e[0m"
