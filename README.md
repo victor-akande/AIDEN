@@ -99,7 +99,7 @@ The password is used through `expect` and is only held in memory. It is never wr
 Both init scripts install Cilium with:
 
 - **kube-proxy replacement** (`kubeProxyReplacement=true`). `kubeadm` runs with `--skip-phases=addon/kube-proxy`, and Cilium handles ClusterIP, NodePort, and LoadBalancer services in eBPF.
-- **BGP Control Plane** (`bgpControlPlane.enabled=true`)
+- **BGP Control Plane** (`bgpControlPlane.enabled=true`), only when you give a BGP peer
 - **L2 announcements** (`l2announcements.enabled=true`), so LoadBalancer IPs answer ARP on the LAN
 - **Hubble** with relay and UI, plus the `cilium` and `hubble` CLIs
 - `socketLB.hostNamespaceOnly=true`, which Cilium recommends for KubeVirt VMs
@@ -112,7 +112,17 @@ You will be asked for (all optional, press Enter to skip):
 | BGP peer IP | `10.0.0.1` | `CiliumBGPClusterConfig` peering with your router |
 | Local / peer ASN | `65001` / `65000` | BGP session |
 
-When a BGP peer is set, each node advertises its Pod CIDR and all LoadBalancer IPs. The generated resources are saved in `/var/lib/aiden-lab/cilium-network.yaml`, and you can edit and re-apply that file later. Set `CILIUM_VERSION=1.x.y` to pin a release (1.16 or newer); the default is the latest stable.
+When a BGP peer is set, each node advertises its Pod CIDR and all LoadBalancer IPs.
+
+**L2-only (no BGP):** enter an IP pool and leave the BGP peer blank. Cilium runs with BGP switched off and announces the LoadBalancer IPs on the LAN through ARP. In this mode:
+
+- the pool must be in the nodes' subnet, and clients must be on the same layer-2 network (ARP does not cross routers)
+- for each service, one node answers for its IP, and another takes over within a few seconds if that node fails; there is no load balancing across nodes for a single IP
+- on nodes with several network cards, you may need to set Cilium's `devices` option so announcements go out on the right interface
+
+To turn BGP on later, run `cilium upgrade --reuse-values --set bgpControlPlane.enabled=true`, restart the agents with `kubectl -n kube-system rollout restart ds/cilium deploy/cilium-operator`, then apply your own `CiliumBGPClusterConfig`, `CiliumBGPPeerConfig`, and `CiliumBGPAdvertisement`.
+
+The generated resources are saved in `/var/lib/aiden-lab/cilium-network.yaml`, and you can edit and re-apply that file later. Set `CILIUM_VERSION=1.x.y` to pin a release (1.16 or newer); the default is the latest stable.
 
 Useful commands:
 
@@ -171,11 +181,13 @@ You will be asked for:
 - memory per VM
 - CPU cores per VM
 - VM name prefix
-- starting RDP NodePort (default `30001`)
+- how to expose RDP:
+  - **NodePort**: `<node-ip>:30001`, `30002`, ... (you choose the starting port)
+  - **LoadBalancer**: each VM gets its own IP from the Cilium pool on the standard port, for example `10.0.0.241:3389`. This is the default when a pool exists.
 
-Ports that are already in use are skipped automatically. Re-running with the same prefix keeps each existing VM's port. Live migration (`evictionStrategy: LiveMigrate`) is only enabled when the cluster has at least two schedulable nodes.
+With NodePort, ports that are already in use are skipped automatically. Re-running with the same prefix keeps each existing VM's port. Live migration (`evictionStrategy: LiveMigrate`) is only enabled when the cluster has at least two schedulable nodes.
 
-Once completed, the script prints the RDP endpoint addresses for each VM.
+Once completed, the script prints the RDP endpoint addresses for each VM. With LoadBalancer, it waits for Cilium to assign each IP first. If an IP stays `<pending>`, the pool has run out of free addresses.
 
 ### 4. Teardown and restore the system
 

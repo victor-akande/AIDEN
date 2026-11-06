@@ -18,11 +18,38 @@ VM_CORES=${VM_CORES:-2}
 read -p "Enter VM Name Prefix [aiden-labs]: " VM_PREFIX
 VM_PREFIX=${VM_PREFIX:-aiden-labs}
 
-read -p "Enter starting RDP NodePort (30000-32767) [30001]: " START_PORT
-START_PORT=${START_PORT:-30001}
-if ! [[ "$START_PORT" =~ ^[0-9]+$ ]] || [ "$START_PORT" -lt 30000 ] || [ "$START_PORT" -gt 32767 ]; then
-  echo "Starting port must be a number between 30000 and 32767." >&2
+# RDP exposure: LoadBalancer gives each VM its own LAN IP on port 3389,
+# announced by Cilium (L2/ARP and/or BGP). It needs a CiliumLoadBalancerIPPool.
+LB_POOLS=$(kubectl get ciliumloadbalancerippools.cilium.io --no-headers 2>/dev/null | wc -l || true)
+if [ "${LB_POOLS:-0}" -gt 0 ]; then
+  DEFAULT_SVC=2
+else
+  DEFAULT_SVC=1
+fi
+echo "How should RDP be exposed?"
+echo "  [1] NodePort      -> <node-ip>:30001, 30002, ..."
+echo "  [2] LoadBalancer  -> <own-ip>:3389 per VM (needs a Cilium LoadBalancer IP pool)"
+read -p "Select service type [$DEFAULT_SVC]: " SVC_CHOICE
+SVC_CHOICE=${SVC_CHOICE:-$DEFAULT_SVC}
+case "$SVC_CHOICE" in
+  1) SVC_TYPE=NodePort ;;
+  2) SVC_TYPE=LoadBalancer ;;
+  *) echo "Invalid choice: $SVC_CHOICE" >&2; exit 1 ;;
+esac
+
+if [ "$SVC_TYPE" = "LoadBalancer" ] && [ "${LB_POOLS:-0}" -eq 0 ]; then
+  echo "No CiliumLoadBalancerIPPool found, so LoadBalancer services would never get an IP." >&2
+  echo "Create one (see README: Cilium networking) or choose NodePort." >&2
   exit 1
+fi
+
+if [ "$SVC_TYPE" = "NodePort" ]; then
+  read -p "Enter starting RDP NodePort (30000-32767) [30001]: " START_PORT
+  START_PORT=${START_PORT:-30001}
+  if ! [[ "$START_PORT" =~ ^[0-9]+$ ]] || [ "$START_PORT" -lt 30000 ] || [ "$START_PORT" -gt 32767 ]; then
+    echo "Starting port must be a number between 30000 and 32767." >&2
+    exit 1
+  fi
 fi
 
 # 2. Configuration
@@ -46,12 +73,15 @@ else
   EVICTION_STRATEGY="None"
 fi
 echo "-> Schedulable nodes: ${SCHEDULABLE_NODES:-0} (evictionStrategy: $EVICTION_STRATEGY)"
+echo "-> RDP service type: $SVC_TYPE"
 
-# NodePorts already taken anywhere in the cluster
-USED_PORTS=" $(kubectl get svc -A -o jsonpath='{range .items[*]}{.spec.ports[*].nodePort}{" "}{end}') "
+if [ "$SVC_TYPE" = "NodePort" ]; then
+  # NodePorts already taken anywhere in the cluster
+  USED_PORTS=" $(kubectl get svc -A -o jsonpath='{range .items[*]}{.spec.ports[*].nodePort}{" "}{end}') "
+  NEXT_PORT=$START_PORT
+fi
 
 declare -a VM_PORTS
-NEXT_PORT=$START_PORT
 
 echo "Generating batch manifest for $VM_COUNT VMs..."
 
@@ -60,23 +90,43 @@ for ((i=1; i<=VM_COUNT; i++))
 do
   VM_NAME="${VM_PREFIX}-${i}"
 
-  # Reuse the port if this VM's service already exists (re-run/update),
-  # otherwise take the next free port.
-  EXISTING_PORT=$(kubectl get svc "${VM_NAME}-rdp" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
-  if [ -n "$EXISTING_PORT" ]; then
-    NODE_PORT=$EXISTING_PORT
-  else
-    while [[ "$USED_PORTS" == *" $NEXT_PORT "* ]]; do
-      NEXT_PORT=$((NEXT_PORT + 1))
-    done
-    if [ "$NEXT_PORT" -gt 32767 ]; then
-      echo "Ran out of free NodePorts in the 30000-32767 range." >&2
-      exit 1
+  if [ "$SVC_TYPE" = "NodePort" ]; then
+    # Reuse the port if this VM's NodePort service already exists (re-run/update),
+    # otherwise take the next free port.
+    EXISTING_PORT=$(kubectl get svc "${VM_NAME}-rdp" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
+    if [ -n "$EXISTING_PORT" ]; then
+      NODE_PORT=$EXISTING_PORT
+    else
+      while [[ "$USED_PORTS" == *" $NEXT_PORT "* ]]; do
+        NEXT_PORT=$((NEXT_PORT + 1))
+      done
+      if [ "$NEXT_PORT" -gt 32767 ]; then
+        echo "Ran out of free NodePorts in the 30000-32767 range." >&2
+        exit 1
+      fi
+      NODE_PORT=$NEXT_PORT
+      USED_PORTS="$USED_PORTS$NODE_PORT "
     fi
-    NODE_PORT=$NEXT_PORT
-    USED_PORTS="$USED_PORTS$NODE_PORT "
+    VM_PORTS+=("$NODE_PORT")
+    SVC_SPEC="  type: NodePort
+  selector:
+    kubevirt.io/domain: ${VM_NAME}
+  ports:
+    - protocol: TCP
+      port: 3389
+      targetPort: 3389
+      nodePort: ${NODE_PORT}"
+  else
+    # No NodePort needed: Cilium answers for the LB IP directly
+    SVC_SPEC="  type: LoadBalancer
+  allocateLoadBalancerNodePorts: false
+  selector:
+    kubevirt.io/domain: ${VM_NAME}
+  ports:
+    - protocol: TCP
+      port: 3389
+      targetPort: 3389"
   fi
-  VM_PORTS+=("$NODE_PORT")
 
   cat <<EOF >> "$MANIFEST_FILE"
 apiVersion: kubevirt.io/v1
@@ -129,14 +179,7 @@ metadata:
   labels:
     app: ${VM_PREFIX}
 spec:
-  type: NodePort
-  selector:
-    kubevirt.io/domain: ${VM_NAME}
-  ports:
-    - protocol: TCP
-      port: 3389
-      targetPort: 3389
-      nodePort: ${NODE_PORT}
+${SVC_SPEC}
 ---
 EOF
 done
@@ -144,6 +187,21 @@ done
 # 4. Deploy
 echo "Applying manifests..."
 kubectl apply -f "$MANIFEST_FILE"
+
+# 5. For LoadBalancer services, wait for Cilium LB IPAM to assign IPs
+if [ "$SVC_TYPE" = "LoadBalancer" ]; then
+  echo "Waiting for LoadBalancer IPs to be assigned..."
+  for ((i=1; i<=VM_COUNT; i++)); do
+    VM_NAME="${VM_PREFIX}-${i}"
+    LB_IP=""
+    for _ in $(seq 1 30); do
+      LB_IP=$(kubectl get svc "${VM_NAME}-rdp" -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+      [ -n "$LB_IP" ] && break
+      sleep 2
+    done
+    VM_PORTS+=("${LB_IP:-<pending>}")
+  done
+fi
 
 echo "=========================================================="
 echo "✅ Deployment Complete!"
@@ -153,6 +211,13 @@ echo "----------------------------------------------------------"
 echo "RDP Credentials: $USERNAME / $PASSWORD"
 for ((i=1; i<=VM_COUNT; i++))
 do
-  echo "  - ${VM_PREFIX}-${i} -> ${NODE_IP}:${VM_PORTS[$((i-1))]}"
+  if [ "$SVC_TYPE" = "NodePort" ]; then
+    echo "  - ${VM_PREFIX}-${i} -> ${NODE_IP}:${VM_PORTS[$((i-1))]}"
+  else
+    echo "  - ${VM_PREFIX}-${i} -> ${VM_PORTS[$((i-1))]}:3389"
+  fi
 done
+if [ "$SVC_TYPE" = "LoadBalancer" ] && [[ " ${VM_PORTS[*]} " == *"<pending>"* ]]; then
+  echo "Some IPs are still pending. Check the pool has free addresses: kubectl get ciliumloadbalancerippools"
+fi
 echo "=========================================================="

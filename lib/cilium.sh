@@ -5,7 +5,7 @@
 #
 # Installs Cilium with:
 #   - kube-proxy replacement (kubeadm must run with --skip-phases=addon/kube-proxy)
-#   - BGP Control Plane
+#   - BGP Control Plane (only when a BGP peer is given)
 #   - L2 announcements + LB IPAM
 #   - Hubble (relay + UI) and the hubble CLI
 #
@@ -53,7 +53,7 @@ cilium_prompt() {
   echo "Use free addresses on the node network that your DHCP server does not hand out."
   read -p "LoadBalancer IP pool (CIDR e.g. 10.0.0.240/28, or range 10.0.0.240-10.0.0.250) [skip]: " LB_POOL
 
-  read -p "BGP peer (router) IP address [skip BGP peering]: " BGP_PEER_IP
+  read -p "BGP peer (router) IP address [skip: L2-only, BGP off]: " BGP_PEER_IP
   if [ -n "$BGP_PEER_IP" ]; then
     read -p "Local (cluster) BGP ASN [65001]: " BGP_LOCAL_ASN
     BGP_LOCAL_ASN=${BGP_LOCAL_ASN:-65001}
@@ -104,7 +104,11 @@ cilium_install() {
     return 1
   fi
 
-  echo "   -> Installing Cilium ${CILIUM_VERSION}..."
+  # BGP is only switched on when a peer was given; L2-only setups run without it.
+  local bgp_enabled=false
+  [ -n "$BGP_PEER_IP" ] && bgp_enabled=true
+
+  echo "   -> Installing Cilium ${CILIUM_VERSION} (BGP: ${bgp_enabled})..."
   cilium install --version "$CILIUM_VERSION" \
     --set kubeProxyReplacement=true \
     --set k8sServiceHost="$api_ip" \
@@ -112,7 +116,7 @@ cilium_install() {
     --set ipam.mode=kubernetes \
     --set operator.replicas="$operator_replicas" \
     --set socketLB.hostNamespaceOnly=true \
-    --set bgpControlPlane.enabled=true \
+    --set bgpControlPlane.enabled="$bgp_enabled" \
     --set l2announcements.enabled=true \
     --set externalIPs.enabled=true \
     --set k8sClientRateLimit.qps=50 \
@@ -134,13 +138,16 @@ cilium_apply_network_config() {
   : > "$manifest"
 
   if [ -z "$LB_POOL" ] && [ -z "$BGP_PEER_IP" ]; then
-    echo "   -> No LoadBalancer pool or BGP peer given; BGP and L2 are enabled but not configured."
+    echo "   -> No LoadBalancer pool or BGP peer given; L2 announcements are enabled but have no IPs to announce."
     return 0
   fi
 
-  local crds=(ciliumloadbalancerippools.cilium.io ciliuml2announcementpolicies.cilium.io
-              ciliumbgpclusterconfigs.cilium.io ciliumbgppeerconfigs.cilium.io
-              ciliumbgpadvertisements.cilium.io)
+  local crds=(ciliumloadbalancerippools.cilium.io ciliuml2announcementpolicies.cilium.io)
+  if [ -n "$BGP_PEER_IP" ]; then
+    # BGP CRDs are only registered when the BGP Control Plane is enabled
+    crds+=(ciliumbgpclusterconfigs.cilium.io ciliumbgppeerconfigs.cilium.io
+           ciliumbgpadvertisements.cilium.io)
+  fi
   local crd
   for crd in "${crds[@]}"; do
     kubectl wait --for=condition=Established "crd/$crd" --timeout=180s
@@ -228,10 +235,18 @@ EOF
 }
 
 cilium_print_summary() {
-  echo "Cilium:  kube-proxy replacement, BGP Control Plane, L2 announcements, Hubble"
+  if [ -n "$BGP_PEER_IP" ]; then
+    echo "Cilium:  kube-proxy replacement, BGP Control Plane, L2 announcements, Hubble"
+  else
+    echo "Cilium:  kube-proxy replacement, L2 announcements, Hubble (BGP off)"
+  fi
   [ -n "$LB_POOL" ]     && echo "  LB pool:  $LB_POOL (announced via L2${BGP_PEER_IP:+ and BGP})"
-  [ -n "$BGP_PEER_IP" ] && echo "  BGP:      AS${BGP_LOCAL_ASN} <-> ${BGP_PEER_IP} AS${BGP_PEER_ASN}"
-  echo "  Status:   cilium status   |   BGP: cilium bgp peers"
+  if [ -n "$BGP_PEER_IP" ]; then
+    echo "  BGP:      AS${BGP_LOCAL_ASN} <-> ${BGP_PEER_IP} AS${BGP_PEER_ASN}   (check: cilium bgp peers)"
+  else
+    echo "  BGP:      off — enable later with: cilium upgrade --reuse-values --set bgpControlPlane.enabled=true"
+  fi
+  echo "  Status:   cilium status"
   echo "  Hubble:   cilium hubble ui   (or: cilium hubble port-forward & hubble observe)"
   return 0
 }
